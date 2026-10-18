@@ -1679,9 +1679,8 @@ static int doLoad(char** argv, char * const envp[]) {
         if (!isEng() || GetProperty("ro.product.device", "") != "thor" ||
             uname(&u) || strncmp(u.release, "3.4.", 4) ||
             strcmp(u.machine, "armv7l") || !isKernel32Bit() ||
-            !GetProperty("ro.bpf.kver_override", "").empty() ||
-            !probeThorBpfBackports()) {
-            ALOGE("thor BPF backport eligibility or runtime probe failed");
+            !GetProperty("ro.bpf.kver_override", "").empty()) {
+            ALOGE("thor BPF backport eligibility failed");
             return 90;
         }
         thorBpfBackports = true;
@@ -1952,6 +1951,13 @@ static int doLoad(char** argv, char * const envp[]) {
         }
     } else {  // implies S/T with 4.9 kernel
         // nothing we can do.
+    }
+
+    // Probe after the initial empty-ID check: BPF program release uses RCU,
+    // so a just-closed probe can still be visible to ID enumeration briefly.
+    if (thorBpfBackports && !probeThorBpfBackports()) {
+        ALOGE("thor BPF runtime probe failed");
+        return 91;
     }
 
     // Load all ELF objects, create programs and maps, and pin them
