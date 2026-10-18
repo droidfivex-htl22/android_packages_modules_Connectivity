@@ -86,6 +86,76 @@ using std::vector;
 namespace android {
 namespace bpf {
 
+// Experimental thor port: select the 5.4-era BPF ELF variants explicitly.
+// This does not change uname, KernelUtils, or the reported kernel/ABI.
+// All selected objects must still pass the real kernel verifier and pinning.
+static bool thorBpfBackports = false;
+static unsigned bpfObjectBaseline() {
+    return thorBpfBackports ? ((5U << 24) | (4U << 16)) : kernelVer;
+}
+static bool bpfBackportAtLeast(unsigned major, unsigned minor, unsigned patch = 0) {
+    if (!thorBpfBackports) return isAtLeastKernelVersion(major, minor, patch);
+    return bpfObjectBaseline() >= ((major << 24) | (minor << 16) | patch);
+}
+
+static int thorBpfCall(enum bpf_cmd cmd, union bpf_attr* attr) {
+    return syscall(__NR_bpf, cmd, attr, sizeof(*attr));
+}
+
+static bool probeThorBpfBackports() {
+    // No probe objects or pins survive this function.
+    const unsigned types[] = {BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_ARRAY,
+        BPF_MAP_TYPE_PERCPU_HASH, BPF_MAP_TYPE_PERCPU_ARRAY,
+        BPF_MAP_TYPE_LPM_TRIE, BPF_MAP_TYPE_DEVMAP, BPF_MAP_TYPE_DEVMAP_HASH};
+    for (unsigned type : types) {
+        union bpf_attr attr = {};
+        attr.map_type = type;
+        attr.key_size = type == BPF_MAP_TYPE_LPM_TRIE ? 8 : 4;
+        attr.value_size = 4;
+        attr.max_entries = 1;
+        if (type == BPF_MAP_TYPE_LPM_TRIE) attr.map_flags = BPF_F_NO_PREALLOC;
+        unique_fd fd(thorBpfCall(BPF_MAP_CREATE, &attr));
+        if (fd.get() < 0 || bpfGetFdMapId(fd) <= 0) {
+            ALOGE("thor BPF map probe type=%u failed: %s", type, strerror(errno));
+            return false;
+        }
+    }
+    struct bpf_insn insns[] = {{0xb7, 0, 0, 0, 4}, {0x95, 0, 0, 0, 0}};
+    char verifierLog[4096] = {};
+    union bpf_attr attr = {};
+    attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+    attr.insn_cnt = 2;
+    attr.insns = reinterpret_cast<uintptr_t>(insns);
+    attr.license = reinterpret_cast<uintptr_t>("GPL");
+    attr.log_level = 1;
+    attr.log_size = sizeof(verifierLog);
+    attr.log_buf = reinterpret_cast<uintptr_t>(verifierLog);
+    unique_fd prog(thorBpfCall(BPF_PROG_LOAD, &attr));
+    if (prog.get() < 0 || bpfGetFdProgId(prog) <= 0 || bpfGetFdJitProgLen(prog) <= 0) {
+        ALOGE("thor BPF JIT probe failed: %s: %s", strerror(errno), verifierLog);
+        return false;
+    }
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sockets)) return false;
+    unique_fd tx(sockets[0]), rx(sockets[1]);
+    int fd = prog.get();
+    char result[8] = {};
+    if (setsockopt(rx.get(), SOL_SOCKET, SO_ATTACH_BPF, &fd, sizeof(fd)) ||
+        send(tx.get(), "ABCDEFGH", 8, 0) != 8 ||
+        recv(rx.get(), result, sizeof(result), 0) != 4 || memcmp(result, "ABCD", 4)) {
+        ALOGE("thor BPF execution probe failed: %s", strerror(errno));
+        return false;
+    }
+    insns[0].code = 0x05;
+    insns[0].off = 100;
+    unique_fd invalid(thorBpfCall(BPF_PROG_LOAD, &attr));
+    if (invalid.get() >= 0) {
+        ALOGE("thor BPF verifier accepted invalid program");
+        return false;
+    }
+    return true;
+}
+
 // This verifies the macro and the C++ api are in sync, and that they're compile time known.
 constexpr auto useLibBpf = COM_ANDROID_TETHERING_READONLY_FLAGS_USE_LIBBPF;
 static_assert(std::is_same<decltype(useLibBpf), const bool>::value, "useLibBpf must be a boolean.");
@@ -448,7 +518,7 @@ int readCodeSections(ElfObject& elfObj, vector<codeSection>& cs) {
 }
 
 static unsigned int sanitizeMapFlags(unsigned int map_flags) {
-    if (!isAtLeastKernelVersion(5, 10)) map_flags &= ~BPF_F_MMAPABLE;
+    if (!bpfBackportAtLeast(5, 10)) map_flags &= ~BPF_F_MMAPABLE;
     return map_flags;
 }
 
@@ -460,7 +530,7 @@ static bool mapMatchesExpectations(const unique_fd& fd,
     // This is because the primary failure mode we're trying to detect here
     // is either a source code misconfiguration (which is likely kernel independent)
     // or a newly introduced kernel feature/bug (which is unlikely to get backported to 4.9).
-    if (!isAtLeastKernelVersion(4, 14)) return true;
+    if (!bpfBackportAtLeast(4, 14)) return true;
 
     // Assuming fd is a valid Bpf Map file descriptor then
     // all the following should always succeed on a 4.14+ kernel.
@@ -638,7 +708,7 @@ static int loadBtf(ElfObject &elfObj, struct btf *btf) {
         if (ret) return ret;
     }
 
-    if (!isAtLeastKernelVersion(5, 10)) {
+    if (!bpfBackportAtLeast(5, 10)) {
         // Likely unnecessary on kernel 5.4 but untested.
         sanitizeBtf(btf);
     }
@@ -774,7 +844,7 @@ static int pinMap(const borrowed_fd& fd, const struct bpf_map_def& mapDef) {
             return -err;
         }
 
-        if (isAtLeastKernelVersion(4, 14)) {
+        if (bpfBackportAtLeast(4, 14)) {
             int mapId = bpfGetFdMapId(fd);
             if (mapId == -1) {
                 const int err = errno;
@@ -787,7 +857,7 @@ static int pinMap(const borrowed_fd& fd, const struct bpf_map_def& mapDef) {
 }
 
 static bool isMapTypeSupported(enum bpf_map_type type) {
-    if (type == BPF_MAP_TYPE_LPM_TRIE && !isAtLeastKernelVersion(4, 14)) {
+    if (type == BPF_MAP_TYPE_LPM_TRIE && !bpfBackportAtLeast(4, 14)) {
         // On Linux Kernels older than 4.14 this map type doesn't exist - autoskip.
         return false;
     }
@@ -795,7 +865,7 @@ static bool isMapTypeSupported(enum bpf_map_type type) {
 }
 
 static enum bpf_map_type sanitizeMapType(enum bpf_map_type type) {
-    if (type == BPF_MAP_TYPE_DEVMAP && !isAtLeastKernelVersion(4, 14)) {
+    if (type == BPF_MAP_TYPE_DEVMAP && !bpfBackportAtLeast(4, 14)) {
         // On Linux Kernels older than 4.14 this map type doesn't exist, but it can kind
         // of be approximated: ARRAY has the same userspace api, though it is not usable
         // by the same ebpf programs.  However, that's okay because the bpf_redirect_map()
@@ -805,7 +875,7 @@ static enum bpf_map_type sanitizeMapType(enum bpf_map_type type) {
         // Hence using an ARRAY instead of a DEVMAP simply makes life easier for userspace.
         return BPF_MAP_TYPE_ARRAY;
     }
-    if (type == BPF_MAP_TYPE_DEVMAP_HASH && !isAtLeastKernelVersion(5, 4)) {
+    if (type == BPF_MAP_TYPE_DEVMAP_HASH && !bpfBackportAtLeast(5, 4)) {
         // On Linux Kernels older than 5.4 this map type doesn't exist, but it can kind
         // of be approximated: HASH has the same userspace visible api.
         // However it cannot be used by ebpf programs in the same way.
@@ -824,7 +894,7 @@ static int createMaps(ElfObject& elfObj, vector<struct bpf_map_def>& md, vector<
     vector<char> btfData;
     struct btf *btf = NULL;
     auto btfGuard = base::make_scope_guard([&btf] { if (btf) btf__free(btf); });
-    if (isAtLeastKernelVersion(4, 19)) {
+    if (bpfBackportAtLeast(4, 19)) {
         // On Linux Kernels older than 4.18 BPF_BTF_LOAD command doesn't exist.
         ret = elfObj.readSectionByName(".BTF", btfData);
         if (ret) {
@@ -856,16 +926,16 @@ static int createMaps(ElfObject& elfObj, vector<struct bpf_map_def>& md, vector<
             continue;
         }
 
-        if (kernelVer < md[i].min_kver) {
+        if (bpfObjectBaseline() < md[i].min_kver) {
             ALOGD("skipping map %s which requires kernel version 0x%x >= 0x%x",
-                  md[i].name(), kernelVer, md[i].min_kver);
+                  md[i].name(), bpfObjectBaseline(), md[i].min_kver);
             mapFds.push_back(unique_fd());
             continue;
         }
 
-        if (kernelVer >= md[i].max_kver) {
+        if (bpfObjectBaseline() >= md[i].max_kver) {
             ALOGD("skipping map %s which requires kernel version 0x%x < 0x%x",
-                  md[i].name(), kernelVer, md[i].max_kver);
+                  md[i].name(), bpfObjectBaseline(), md[i].max_kver);
             mapFds.push_back(unique_fd());
             continue;
         }
@@ -901,7 +971,7 @@ static int createMaps(ElfObject& elfObj, vector<struct bpf_map_def>& md, vector<
               .max_entries = max_entries,
               .map_flags = sanitizeMapFlags(md[i].map_flags),
             };
-            if (isAtLeastKernelVersion(4, 15))
+            if (bpfBackportAtLeast(4, 15))
                 strlcpy(req.map_name, md[i].name(), sizeof(req.map_name));
 
             bool haveBtf = btf && isBtfSupported(type);
@@ -1032,7 +1102,7 @@ static int pinProg(const borrowed_fd& fd, const struct bpf_prog_def& progDef) {
 }
 
 static int validateProg(const borrowed_fd& fd, const char* const progPinLoc) {
-    if (!isAtLeastKernelVersion(4, 14)) {
+    if (!bpfBackportAtLeast(4, 14)) {
         return 0;
     }
     int progId = bpfGetFdProgId(fd);
@@ -1079,8 +1149,8 @@ static int loadCodeSections(ElfObject& elfObj, vector<codeSection>& cs, const st
               cs[i].prog_def->min_kver, cs[i].prog_def->max_kver,
               cs[i].prog_def->bpfloader_min_ver, cs[i].prog_def->bpfloader_max_ver);
 
-        if (kernelVer < cs[i].prog_def->min_kver) continue;
-        if (kernelVer >= cs[i].prog_def->max_kver) continue;
+        if (bpfObjectBaseline() < cs[i].prog_def->min_kver) continue;
+        if (bpfObjectBaseline() >= cs[i].prog_def->max_kver) continue;
         if (api_level_full < cs[i].prog_def->bpfloader_min_ver) continue;
         if (api_level_full >= cs[i].prog_def->bpfloader_max_ver) continue;
 
@@ -1103,7 +1173,7 @@ static int loadCodeSections(ElfObject& elfObj, vector<codeSection>& cs, const st
               .log_buf = ptr_to_u64(log_buf),
               .expected_attach_type = cs[i].prog_def->attach_type,
             };
-            if (isAtLeastKernelVersion(4, 15))
+            if (bpfBackportAtLeast(4, 15))
                 strlcpy(req.prog_name, cs[i].prog_def->name(), sizeof(req.prog_name));
             fd.reset(bpf(BPF_PROG_LOAD, req));
 
@@ -1168,9 +1238,9 @@ static int prepareLoadMaps(const struct bpf_object* obj, const vector<struct bpf
             continue;
         }
 
-        if (kernelVer < md[i].min_kver || kernelVer >= md[i].max_kver) {
+        if (bpfObjectBaseline() < md[i].min_kver || bpfObjectBaseline() >= md[i].max_kver) {
             ALOGD("skipping map %s: kernel version 0x%x is outside required range [0x%x, 0x%x)",
-                  md[i].name(), kernelVer, md[i].min_kver, md[i].max_kver);
+                  md[i].name(), bpfObjectBaseline(), md[i].min_kver, md[i].max_kver);
             bpf_map__set_autocreate(m, false);
             continue;
         }
@@ -1202,9 +1272,9 @@ static int prepareLoadProgs(const struct bpf_object* obj, const vector<codeSecti
 
         unsigned min_kver = cs[i].prog_def->min_kver;
         unsigned max_kver = cs[i].prog_def->max_kver;
-        if (kernelVer < min_kver || kernelVer >= max_kver) {
+        if (bpfObjectBaseline() < min_kver || bpfObjectBaseline() >= max_kver) {
             ALOGD("skipping prog %s: kernel version 0x%x is outside required range [0x%x, 0x%x)",
-                  cs[i].prog_def->name(), kernelVer, min_kver, max_kver);
+                  cs[i].prog_def->name(), bpfObjectBaseline(), min_kver, max_kver);
             bpf_program__set_autoload(prog, false);
             continue;
         }
@@ -1308,7 +1378,7 @@ static int loadProgByLibbpf(const char* const elfPath) {
     ret = bpf_object__load(obj);
     if (ret) return ret;
     // On Linux Kernels older than 4.18 BPF_BTF_LOAD command doesn't exist.
-    if (isAtLeastKernelVersion(4, 19) && bpf_object__btf_fd(obj) < 0) return -1;
+    if (bpfBackportAtLeast(4, 19) && bpf_object__btf_fd(obj) < 0) return -1;
 
     ret = pinMaps(obj, md);
     if (ret) return ret;
@@ -1604,29 +1674,44 @@ static int doLoad(char** argv, char * const envp[]) {
 
     logTetheringApexVersion();
 
+    if (GetProperty("ro.bpf.thor_backports", "") == "1") {
+        struct utsname u = {};
+        if (!isEng() || GetProperty("ro.product.device", "") != "thor" ||
+            uname(&u) || strncmp(u.release, "3.4.", 4) ||
+            strcmp(u.machine, "armv7l") || !isKernel32Bit() ||
+            !GetProperty("ro.bpf.kver_override", "").empty() ||
+            !probeThorBpfBackports()) {
+            ALOGE("thor BPF backport eligibility or runtime probe failed");
+            return 90;
+        }
+        thorBpfBackports = true;
+        ALOGW("Experimental thor BPF ELF profile 5.4; actual kernel %s/%s. "
+              "Real object loading and validation remain mandatory.", u.release, u.machine);
+    }
+
     // both S and T require kernel 4.9 (and eBpf support)
     // (this also guarantees 'kernelVer' isn't an invalid uninitialized 0)
-    if (!isAtLeastKernelVersion(4, 9)) {
+    if (!thorBpfBackports && !isAtLeastKernelVersion(4, 9)) {
         ALOGE("Android S & T require kernel 4.9.");
         return 3;
     }
 
     // U bumps the kernel requirement up to 4.14
-    if (isAtLeastU && !isAtLeastKernelVersion(4, 14)) {
+    if (!thorBpfBackports && isAtLeastU && !isAtLeastKernelVersion(4, 14)) {
         ALOGE("Android U requires kernel 4.14.");
         return 4;
     }
 
     // V bumps the kernel requirement up to 4.19
     // see also: //system/netd/tests/kernel_test.cpp TestKernel419
-    if (isAtLeastV && !isAtLeastKernelVersion(4, 19)) {
+    if (!thorBpfBackports && isAtLeastV && !isAtLeastKernelVersion(4, 19)) {
         ALOGE("Android V requires kernel 4.19.");
         return 5;
     }
 
     // 25Q2 bumps the kernel requirement up to 5.4
     // see also: //system/netd/tests/kernel_test.cpp TestKernel54
-    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4)) {
+    if (!thorBpfBackports && isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4)) {
         ALOGE("Android 25Q2 requires kernel 5.4.");
         return 6;
     }
@@ -1644,7 +1729,7 @@ static int doLoad(char** argv, char * const envp[]) {
         if (!isTV()) return 8;
     }
 
-    if (isKernel32Bit() && isAtLeast25Q2) {
+    if (!thorBpfBackports && isKernel32Bit() && isAtLeast25Q2) {
         ALOGE("Android 25Q2 requires 64 bit kernel.");
         return 9;
     }
