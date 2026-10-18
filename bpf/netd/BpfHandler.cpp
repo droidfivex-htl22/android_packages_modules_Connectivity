@@ -22,6 +22,7 @@
 #include <inttypes.h>
 
 #include <android-base/unique_fd.h>
+#include <android-base/properties.h>
 #include <bpf/WaitForProgsLoaded.h>
 #include <log/log.h>
 #include <netdutils/UidConstants.h>
@@ -44,6 +45,18 @@ using bpf::queryProgram;
 using bpf::retrieveProgram;
 using netdutils::Status;
 using netdutils::statusFromErrno;
+
+// The loader probes and validates real programs before marking them ready.
+// Use the same explicit ELF/API profile for attachment, retaining every error.
+static bool isThorBpfApiAtLeast(unsigned major, unsigned minor, unsigned patch = 0) {
+    const bool thor = base::GetProperty("ro.bpf.thor_backports", "") == "1" &&
+            base::GetProperty("ro.product.device", "") == "thor" && base::GetProperty("ro.build.type", "") == "eng" &&
+            bpf::kernelVer >= KVER(3, 4, 0) && bpf::kernelVer < KVER(3, 5, 0) &&
+            bpf::isArm() && bpf::isKernel32Bit() &&
+            base::GetProperty("ro.bpf.kver_override", "").empty();
+    if (thor) return KVER(major, minor, patch) <= KVER(5, 4, 0);
+    return isAtLeastKernelVersion(major, minor, patch);
+}
 
 constexpr int PER_UID_STATS_ENTRIES_LIMIT = 500;
 // At most 90% of the stats map may be used by tagged traffic entries. This ensures
@@ -82,12 +95,12 @@ static Status initPrograms(const char* cg2_path) {
     if (!isAtLeastT) return Status("S- platform is unsupported");
 
     // S requires eBPF support which was only added in 4.9, so this should be satisfied.
-    if (!isAtLeastKernelVersion(4, 9)) {
+    if (!isThorBpfApiAtLeast(4, 9)) {
         return Status("kernel version < 4.9.0 is unsupported");
     }
 
     // U bumps the kernel requirement up to 4.14
-    if (isAtLeastU && !isAtLeastKernelVersion(4, 14)) {
+    if (isAtLeastU && !isThorBpfApiAtLeast(4, 14)) {
         return Status("U+ platform with kernel version < 4.14.0 is unsupported");
     }
 
@@ -97,12 +110,12 @@ static Status initPrograms(const char* cg2_path) {
     }
 
     // V bumps the kernel requirement up to 4.19
-    if (isAtLeastV && !isAtLeastKernelVersion(4, 19)) {
+    if (isAtLeastV && !isThorBpfApiAtLeast(4, 19)) {
         return Status("V+ platform with kernel version < 4.19.0 is unsupported");
     }
 
     // 25Q2 bumps the kernel requirement up to 5.4
-    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4)) {
+    if (isAtLeast25Q2 && !isThorBpfApiAtLeast(5, 4)) {
         return Status("25Q2+ platform with kernel version < 5.4.0 is unsupported");
     }
 
@@ -121,12 +134,12 @@ static Status initPrograms(const char* cg2_path) {
     // cgroup if the program is pinned properly.
     // TODO: delete the if statement once all devices should support cgroup
     // socket filter (ie. the minimum kernel version required is 4.14).
-    if (isAtLeastKernelVersion(4, 14)) {
+    if (isThorBpfApiAtLeast(4, 14)) {
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_INET_CREATE_PROG_PATH,
                                     cg_fd, BPF_CGROUP_INET_SOCK_CREATE));
     }
 
-    if (isAtLeastKernelVersion(5, 10)) {
+    if (isThorBpfApiAtLeast(5, 10)) {
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_INET_RELEASE_PROG_PATH,
                                     cg_fd, BPF_CGROUP_INET_SOCK_RELEASE));
     }
@@ -134,7 +147,7 @@ static Status initPrograms(const char* cg2_path) {
     if (isAtLeastV) {
         // V requires 4.19+, so technically this 2nd 'if' is not required, but it
         // doesn't hurt us to try to support AOSP forks that try to support older kernels.
-        if (isAtLeastKernelVersion(4, 19)) {
+        if (isThorBpfApiAtLeast(4, 19)) {
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_CONNECT4_PROG_PATH,
                                         cg_fd, BPF_CGROUP_INET4_CONNECT));
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_CONNECT6_PROG_PATH,
@@ -149,7 +162,7 @@ static Status initPrograms(const char* cg2_path) {
                                         cg_fd, BPF_CGROUP_UDP6_SENDMSG));
         }
 
-        if (isAtLeastKernelVersion(5, 4)) {
+        if (isThorBpfApiAtLeast(5, 4)) {
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_GETSOCKOPT_PROG_PATH,
                                         cg_fd, BPF_CGROUP_GETSOCKOPT));
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_SETSOCKOPT_PROG_PATH,
@@ -157,7 +170,7 @@ static Status initPrograms(const char* cg2_path) {
         }
     }
 
-    if (isAtLeastKernelVersion(4, 19)) {
+    if (isThorBpfApiAtLeast(4, 19)) {
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_BIND4_PROG_PATH,
                 cg_fd, BPF_CGROUP_INET4_BIND));
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_BIND6_PROG_PATH,
@@ -172,14 +185,14 @@ static Status initPrograms(const char* cg2_path) {
         if (queryProgram(cg_fd, BPF_CGROUP_INET6_BIND) <= 0) abort();
     }
 
-    if (isAtLeastKernelVersion(5, 10)) {
+    if (isThorBpfApiAtLeast(5, 10)) {
         if (queryProgram(cg_fd, BPF_CGROUP_INET_SOCK_RELEASE) <= 0) abort();
     }
 
     if (isAtLeastV) {
         // V requires 4.19+, so technically this 2nd 'if' is not required, but it
         // doesn't hurt us to try to support AOSP forks that try to support older kernels.
-        if (isAtLeastKernelVersion(4, 19)) {
+        if (isThorBpfApiAtLeast(4, 19)) {
             if (queryProgram(cg_fd, BPF_CGROUP_INET4_CONNECT) <= 0) abort();
             if (queryProgram(cg_fd, BPF_CGROUP_INET6_CONNECT) <= 0) abort();
             if (queryProgram(cg_fd, BPF_CGROUP_UDP4_RECVMSG) <= 0) abort();
@@ -188,7 +201,7 @@ static Status initPrograms(const char* cg2_path) {
             if (queryProgram(cg_fd, BPF_CGROUP_UDP6_SENDMSG) <= 0) abort();
         }
 
-        if (isAtLeastKernelVersion(5, 4)) {
+        if (isThorBpfApiAtLeast(5, 4)) {
             if (queryProgram(cg_fd, BPF_CGROUP_GETSOCKOPT) <= 0) abort();
             if (queryProgram(cg_fd, BPF_CGROUP_SETSOCKOPT) <= 0) abort();
         }
@@ -319,7 +332,7 @@ static void mapLockTest(void) {
 
 Status BpfHandler::initMaps() {
     // bpfLock() requires bpfGetFdMapId which is only available on 4.14+ kernels.
-    if (isAtLeastKernelVersion(4, 14)) {
+    if (isThorBpfApiAtLeast(4, 14)) {
         mapLockTest();
     }
 
@@ -378,7 +391,7 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
 
     // On 5.10+ the BPF_CGROUP_INET_SOCK_RELEASE hook takes care of cookie tag map cleanup
     // during socket destruction. As such the socket destroy listener is superfluous.
-    if (!isAtLeastKernelVersion(5, 10)) {
+    if (!isThorBpfApiAtLeast(5, 10)) {
         int socketProto;
         socklen_t protoLen = sizeof(socketProto);
         if (getsockopt(sockFd, SOL_SOCKET, SO_PROTOCOL, &socketProto, &protoLen)) {
