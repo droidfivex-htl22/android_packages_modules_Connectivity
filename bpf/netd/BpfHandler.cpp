@@ -50,7 +50,7 @@ using netdutils::statusFromErrno;
 // Use the same explicit ELF/API profile for attachment, retaining every error.
 static bool isThorBpfApiAtLeast(unsigned major, unsigned minor, unsigned patch = 0) {
     const bool thor = base::GetProperty("ro.bpf.thor_backports", "") == "1" &&
-            base::GetProperty("ro.product.device", "") == "thor" && base::GetProperty("ro.build.type", "") == "eng" &&
+            base::GetProperty("ro.product.device", "") == "thor" &&
             bpf::kernelVer >= KVER(3, 4, 0) && bpf::kernelVer < KVER(3, 5, 0) &&
             bpf::isArm() && bpf::isKernel32Bit() &&
             base::GetProperty("ro.bpf.kver_override", "").empty();
