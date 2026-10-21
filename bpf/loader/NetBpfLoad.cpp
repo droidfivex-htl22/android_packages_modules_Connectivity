@@ -1676,8 +1676,7 @@ static int doLoad(char** argv, char * const envp[]) {
 
     if (GetProperty("ro.bpf.thor_backports", "") == "1") {
         struct utsname u = {};
-        if (GetProperty("ro.product.device", "") != "thor" ||
-            uname(&u) || strncmp(u.release, "3.4.", 4) ||
+        if (uname(&u) || strncmp(u.release, "3.4.", 4) ||
             strcmp(u.machine, "armv7l") || !isKernel32Bit() ||
             !GetProperty("ro.bpf.kver_override", "").empty()) {
             ALOGE("thor BPF backport eligibility failed");
